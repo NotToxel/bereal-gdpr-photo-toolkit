@@ -10,7 +10,7 @@ import subprocess
 from iptcinfo3 import IPTCInfo
 import numpy as np
 
-# --- UPDATED MOVIEPY IMPORT BLOCK ---
+# --- MOVIEPY IMPORT BLOCK ---
 MOVIEPY_ERROR = None
 try:
     from moviepy.editor import VideoFileClip, CompositeVideoClip, ImageClip, ColorClip
@@ -69,8 +69,11 @@ photo_folder = Path('Photos/post/')
 bereal_folder = Path('Photos/bereal')
 output_folder = Path('Photos/post/__processed')
 output_folder_combined = Path('Photos/post/__combined')
+output_folder_combined_reversed = Path('Photos/post/__combined_reversed')
+
 output_folder.mkdir(parents=True, exist_ok=True)
 output_folder_combined.mkdir(parents=True, exist_ok=True)
+output_folder_combined_reversed.mkdir(parents=True, exist_ok=True)
 
 # Print the paths
 print(STYLING["BOLD"] + "\nThe following paths are set for the input and output files:" + STYLING["RESET"])
@@ -79,6 +82,7 @@ if os.path.exists(bereal_folder):
     print(f"Older photo folder: {bereal_folder}")
 print(f"Output folder for singular images: {output_folder}")
 print(f"Output folder for combined images: {output_folder_combined}")
+print(f"Output folder for reversed combined images: {output_folder_combined_reversed}")
 print("")
 
 
@@ -100,52 +104,71 @@ if not MOVIEPY_AVAILABLE:
     logging.warning(STYLING["RED"] + "Video combining skipped because MoviePy failed to load." + STYLING["RESET"])
     logging.warning(STYLING["RED"] + f"Error details: {MOVIEPY_ERROR}" + STYLING["RESET"])
 
-# Settings
+# --- MENU SETTINGS ---
 print(STYLING["BOLD"] + "\nDo you want to access advanced settings or run with default settings?" + STYLING["RESET"])
 print("Default settings are:\n"
       "1. Copied images are converted from WebP to JPEG\n"
       "2. Converted images' filenames do not contain the original filename\n"
-      "3. Combined images are created on top of converted, singular images")
+      "3. Combined images are created\n"
+      "4. Reversed combined images are NOT created\n"
+      "5. WebP files in combined folders are preserved")
 advanced_settings = input("\nEnter " + STYLING["BOLD"] + "'yes'" + STYLING[
     "RESET"] + " for advanced settings or press any key to continue with default settings: ").strip().lower()
 
 if advanced_settings != 'yes':
     print("Continuing with default settings.\n")
 
+# Initialize Variables with Defaults
 convert_to_jpeg = 'yes'
 keep_original_filename = 'no'
 create_combined_images = 'yes'
+create_reversed_combined = 'no'
+delete_combined_webp = 'no'
 
 if advanced_settings == 'yes':
+    # 1. Convert to JPEG
     convert_to_jpeg = None
     while convert_to_jpeg not in ['yes', 'no']:
         convert_to_jpeg = input(
             STYLING["BOLD"] + "\n1. Do you want to convert images from WebP to JPEG? (yes/no): " + STYLING[
                 "RESET"]).strip().lower()
-        if convert_to_jpeg == 'no':
-            print("Your images will not be converted.")
-        if convert_to_jpeg not in ['yes', 'no']:
-            logging.error("Invalid input. Please enter 'yes' or 'no'.")
 
+    # 2. Filename
     print(STYLING["BOLD"] + "\n2. There are two options for how output files can be named" + STYLING["RESET"] + "\n"
                                                                                                                 "Option 1: YYYY-MM-DDTHH-MM-SS_primary/secondary_original-filename.jpeg\n"
-                                                                                                                "Option 2: YYYY-MM-DDTHH-MM-SS_primary/secondary.jpeg\n"
-                                                                                                                "This will only influence the naming scheme of singular images.")
+                                                                                                                "Option 2: YYYY-MM-DDTHH-MM-SS_primary/secondary.jpeg")
     keep_original_filename = None
     while keep_original_filename not in ['yes', 'no']:
         keep_original_filename = input(
             STYLING["BOLD"] + "Do you want to keep the original filename in the renamed file? (yes/no): " + STYLING[
                 "RESET"]).strip().lower()
-        if keep_original_filename not in ['yes', 'no']:
-            logging.error("Invalid input. Please enter 'yes' or 'no'.")
 
+    # 3. Create Combined
     create_combined_images = None
     while create_combined_images not in ['yes', 'no']:
         create_combined_images = input(STYLING[
-                                           "BOLD"] + "\n3. Do you want to create combined images like the original BeReal memories? (yes/no): " +
+                                           "BOLD"] + "\n3. Do you want to create combined images (Standard View)? (yes/no): " +
                                        STYLING["RESET"]).strip().lower()
-        if create_combined_images not in ['yes', 'no']:
-            logging.error("Invalid input. Please enter 'yes' or 'no'.")
+
+    # 4. Create Reversed Combined (Only if Combined is enabled)
+    if create_combined_images == 'yes':
+        create_reversed_combined = None
+        while create_reversed_combined not in ['yes', 'no']:
+            create_reversed_combined = input(STYLING[
+                                                 "BOLD"] + "\n4. Do you want to ALSO create reversed combined images (Swapped)? (yes/no): " +
+                                             STYLING["RESET"]).strip().lower()
+    else:
+        create_reversed_combined = 'no'
+
+    # 5. Delete WebP Cleanup (Only if converting to JPEG and combining)
+    if convert_to_jpeg == 'yes' and create_combined_images == 'yes':
+        delete_combined_webp = None
+        while delete_combined_webp not in ['yes', 'no']:
+            delete_combined_webp = input(STYLING[
+                                             "BOLD"] + "\n5. Do you want to delete the intermediate .webp files in the combined folders? (yes/no): " +
+                                         STYLING["RESET"]).strip().lower()
+    else:
+        delete_combined_webp = 'no'
 
 if convert_to_jpeg == 'no' and create_combined_images == 'no':
     print("Script will continue to run in 5 seconds.")
@@ -183,7 +206,6 @@ def update_exif(image_path, datetime_original, location=None, caption=None):
 
         exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = datetime_original.strftime("%Y:%m:%d %H:%M:%S")
         logging.info(f"Found datetime: {datetime_original}")
-        logging.info(f"Added capture date and time.")
 
         if location and 'latitude' in location:
             logging.info(f"Found location: {location}")
@@ -198,10 +220,9 @@ def update_exif(image_path, datetime_original, location=None, caption=None):
         if caption:
             logging.info(f"Found caption: {caption}")
             exif_dict['0th'][piexif.ImageIFD.ImageDescription] = caption.encode('utf-8')
-            logging.info(f"Updated title with caption.")
 
         piexif.insert(piexif.dump(exif_dict), image_path.as_posix())
-        logging.info(f"Updated EXIF data for {image_path}.")
+        logging.info(f"Updated EXIF data for {image_path.name}.")
     except Exception as e:
         logging.error(f"Failed to update EXIF: {e}")
 
@@ -213,11 +234,10 @@ def update_iptc(image_path, caption):
         if not hasattr(info, '_markers'): info._markers = []
         if caption:
             info['caption/abstract'] = caption
-            logging.info(f"Caption added to converted image.")
         info['source'] = source_app
         info['originating program'] = processing_tool
         info.save_as(path_str)
-        logging.info(f"Updated IPTC data.")
+        logging.info(f"Updated IPTC data for {image_path.name}.")
     except Exception as e:
         logging.error(f"Failed to update IPTC: {e}")
 
@@ -226,7 +246,6 @@ def update_video_metadata(video_path, datetime_original, location=None):
     try:
         timestamp = datetime_original.timestamp()
         os.utime(video_path, (timestamp, timestamp))
-        logging.info(f"Updated video file modification time.")
         try:
             date_str = datetime_original.strftime("%Y:%m:%d %H:%M:%S")
             cmd = ["exiftool", "-overwrite_original", f"-CreateDate={date_str}", f"-DateTimeOriginal={date_str}",
@@ -254,7 +273,6 @@ def remove_backup_files(directory):
         if filename.endswith('~'):
             try:
                 os.remove(os.path.join(directory, filename))
-                print(f"Removed backup file: {filename}")
             except:
                 pass
 
@@ -300,7 +318,6 @@ def combine_videos(primary_path, secondary_path, output_path, primary_meta=None,
 
     try:
         logging.info(f"Combining videos: {primary_path.name}")
-
         primary_clip = VideoFileClip(str(primary_path))
         secondary_clip = VideoFileClip(str(secondary_path))
 
@@ -309,11 +326,8 @@ def combine_videos(primary_path, secondary_path, output_path, primary_meta=None,
             if meta and meta.get('width') and meta.get('height'):
                 target_w = meta['width']
                 target_h = meta['height']
-
-                # Check for mismatch (allow small rounding difference of 2px)
                 if abs(clip.w - target_w) > 2 or abs(clip.h - target_h) > 2:
-                    logging.info(f"Resizing {name} from {clip.w}x{clip.h} to {target_w}x{target_h} based on metadata.")
-                    # We forcibly resize to the metadata dimensions to fix stretching
+                    logging.info(f"Resizing {name} based on metadata.")
                     return clip.resize(newsize=(target_w, target_h))
             return clip
 
@@ -321,24 +335,20 @@ def combine_videos(primary_path, secondary_path, output_path, primary_meta=None,
         secondary_clip = fix_dimensions(secondary_clip, secondary_meta, "secondary")
         # -------------------------------------
 
-        # Parameters
         corner_radius = 60
         outline_size = 7
         position = (55, 55)
         scale_factor = 1 / 3.33333333
 
-        # Resize secondary
         secondary_clip = secondary_clip.resize(scale_factor)
         sec_w, sec_h = secondary_clip.size
 
-        # Mask
         mask_img = Image.new('L', (sec_w, sec_h), 0)
         ImageDraw.Draw(mask_img).rounded_rectangle((0, 0, sec_w, sec_h), corner_radius, fill=255)
         mask_arr = np.array(mask_img) / 255.0
         mask_clip = ImageClip(mask_arr, ismask=True)
         secondary_clip = secondary_clip.set_mask(mask_clip)
 
-        # Border
         border_w = sec_w + (outline_size * 2)
         border_h = sec_h + (outline_size * 2)
         border_mask_img = Image.new('L', (border_w, border_h), 0)
@@ -348,12 +358,10 @@ def combine_videos(primary_path, secondary_path, output_path, primary_meta=None,
         border_clip = ColorClip(size=(border_w, border_h), color=(0, 0, 0)).set_mask(
             ImageClip(border_mask_arr, ismask=True))
 
-        # Sync Duration
         duration = primary_clip.duration
         secondary_clip = secondary_clip.set_duration(duration)
         border_clip = border_clip.set_duration(duration)
 
-        # Composite
         border_pos = (position[0] - outline_size, position[1] - outline_size)
         final = CompositeVideoClip([
             primary_clip,
@@ -362,7 +370,6 @@ def combine_videos(primary_path, secondary_path, output_path, primary_meta=None,
         ])
 
         final.write_videofile(str(output_path), codec='libx264', audio_codec='aac', verbose=False, logger=None)
-
         primary_clip.close()
         secondary_clip.close()
         return True
@@ -371,7 +378,7 @@ def combine_videos(primary_path, secondary_path, output_path, primary_meta=None,
         return False
 
 
-# --- MAIN LOOP ---
+# --- MAIN PROCESSING LOOP ---
 
 try:
     with open('posts.json', encoding="utf8") as f:
@@ -466,8 +473,6 @@ for entry in data:
                 processed_path = dest
 
             processed_files_count += 1
-            logging.info(f"Sucessfully processed {role} image.")
-
             if role in ['primary', 'secondary']:
                 entry_assets[role] = {
                     'path': processed_path,
@@ -506,37 +511,53 @@ if create_combined_images == 'yes':
         timestamp = p_path.name.split('_')[0]
 
         try:
+            # 1. STANDARD COMBINATION
             if p_is_video and s_is_video:
                 combined_filename = f"{timestamp}_combined.mp4"
                 combined_path = output_folder_combined / combined_filename
-
-                # PASS DIMENSIONS TO FIX STRETCHING
-                success = combine_videos(p_path, s_path, combined_path,
-                                         primary_meta=p_dims,
-                                         secondary_meta=s_dims)
-
+                success = combine_videos(p_path, s_path, combined_path, primary_meta=p_dims, secondary_meta=s_dims)
                 if success:
                     combined_files_count += 1
-                    logging.info(f"Combined image saved: {combined_path.name}")
+                    logging.info(f"Combined video saved: {combined_path.name}")
                     update_video_metadata(combined_path, meta['taken_at'], meta['location'])
-                    logging.info(f"Metadata added to combined image.")
 
             elif not p_is_video and not s_is_video:
-                combined_filename = f"{timestamp}_combined.webp"
+                # Fix: Dynamically set extension
+                ext = '.jpg' if convert_to_jpeg == 'yes' else '.webp'
+                combined_filename = f"{timestamp}_combined{ext}"
                 combined_path = output_folder_combined / combined_filename
 
                 img = combine_images(p_path, s_path)
                 img.save(combined_path, 'JPEG' if convert_to_jpeg == 'yes' else 'WEBP', quality=90)
-
                 combined_files_count += 1
                 logging.info(f"Combined image saved: {combined_path.name}")
-
                 update_exif(combined_path, meta['taken_at'], meta['location'], meta['caption'])
-                logging.info(f"Metadata added to combined image.")
                 update_iptc(combined_path, meta['caption'])
 
-                if convert_to_jpeg == 'yes':
-                    pass
+            # 2. REVERSED COMBINATION
+            if create_reversed_combined == 'yes':
+                if p_is_video and s_is_video:
+                    combined_filename_rev = f"{timestamp}_combined_reversed.mp4"
+                    combined_path_rev = output_folder_combined_reversed / combined_filename_rev
+                    # Swap paths AND metadata
+                    success = combine_videos(s_path, p_path, combined_path_rev, primary_meta=s_dims,
+                                             secondary_meta=p_dims)
+                    if success:
+                        logging.info(f"Reversed video saved: {combined_path_rev.name}")
+                        update_video_metadata(combined_path_rev, meta['taken_at'], meta['location'])
+
+                elif not p_is_video and not s_is_video:
+                    # Fix: Dynamically set extension
+                    ext = '.jpg' if convert_to_jpeg == 'yes' else '.webp'
+                    combined_filename_rev = f"{timestamp}_combined_reversed{ext}"
+                    combined_path_rev = output_folder_combined_reversed / combined_filename_rev
+
+                    # Swap paths
+                    img = combine_images(s_path, p_path)
+                    img.save(combined_path_rev, 'JPEG' if convert_to_jpeg == 'yes' else 'WEBP', quality=90)
+                    logging.info(f"Reversed image saved: {combined_path_rev.name}")
+                    update_exif(combined_path_rev, meta['taken_at'], meta['location'], meta['caption'])
+                    update_iptc(combined_path_rev, meta['caption'])
 
             print("")
         except Exception as e:
@@ -544,6 +565,28 @@ if create_combined_images == 'yes':
 
 remove_backup_files(output_folder)
 remove_backup_files(output_folder_combined)
+remove_backup_files(output_folder_combined_reversed)
+
+# --- CLEANUP WEBP IN COMBINED FOLDERS ---
+if delete_combined_webp == 'yes' and convert_to_jpeg == 'yes':
+    print(STYLING['BOLD'] + "Cleaning up WebP files in combined folders..." + STYLING['RESET'])
+
+    # Clean standard combined folder
+    for webp_file in output_folder_combined.glob('*.webp'):
+        try:
+            webp_file.unlink()
+            logging.info(f"Deleted {webp_file.name}")
+        except Exception as e:
+            logging.error(f"Could not delete {webp_file.name}: {e}")
+
+    # Clean reversed combined folder if exists
+    if create_reversed_combined == 'yes':
+        for webp_file in output_folder_combined_reversed.glob('*.webp'):
+            try:
+                webp_file.unlink()
+                logging.info(f"Deleted {webp_file.name}")
+            except Exception as e:
+                logging.error(f"Could not delete {webp_file.name}: {e}")
 
 logging.info(
     f"Finished processing.\nNumber of input-files: {number_of_files}\nTotal files processed: {processed_files_count}\nFiles converted: {converted_files_count}\nFiles skipped: {skipped_files_count}\nFiles combined: {combined_files_count}")
