@@ -55,8 +55,7 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(ColorFormatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 
-# --- MOTION PHOTO CONSTANTS & CLASS (Replicating MotionPhoto2) ---
-# - Exact XMP template from constants.py
+# --- MOTION PHOTO CONSTANTS & CLASS ---
 MOTION_PHOTO_XMP_TEMPLATE = """<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 5.1.0-jc003">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description rdf:about=""
@@ -95,7 +94,6 @@ SAMSUNG_TAG_IDS = {
 SAMSUNG_SEFH_VERSION = 107
 
 
-# - Logic from SamsungTags.py
 class SamsungTags:
     def __init__(self, video_bytes: bytes):
         self.video_bytes = video_bytes
@@ -156,13 +154,17 @@ class SamsungTags:
         return result
 
 
-# --- END MOTION PHOTO CONSTANTS ---
-
-# Initialize counters
+# --- STATISTICS COUNTERS ---
 processed_files_count = 0
 converted_files_count = 0
-combined_files_count = 0
 skipped_files_count = 0
+
+# New specific counters
+stats_standard_combined_count = 0
+stats_reversed_combined_count = 0
+stats_video_source_count = 0  # How many BeReal files were videos
+stats_entries_with_bts_count = 0  # How many entries had BTS
+stats_motion_photos_created = 0
 
 source_app = "BeReal app"
 processing_tool = "github/bereal-gdpr-photo-toolkit"
@@ -186,7 +188,6 @@ if os.path.exists(bereal_folder):
     print(f"Older photo folder: {bereal_folder}")
 print(f"Output folder for singular images: {output_folder}")
 print(f"Output folder for combined images: {output_folder_combined}")
-print(f"Output folder for reversed combined images: {output_folder_combined_reversed}")
 print("")
 
 
@@ -223,10 +224,10 @@ print(STYLING["BOLD"] + "\nDo you want to access advanced settings or run with d
 print("Default settings are:\n"
       "1. Copied images are converted from WebP to JPEG\n"
       "2. Converted images' filenames do not contain the original filename\n"
-      "3. Combined images are created\n"
+      "3. Combined images (Standard) are created\n"
       "4. Reversed combined images are NOT created\n"
       "5. Motion Photos (Live Photos) are NOT created\n"
-      "6. WebP files in combined folders are preserved\n"
+      "6. WebP files in combined folders are DELETED (Cleanup ON)\n"
       "7. Debug logging is OFF")
 
 advanced_settings = input("\nEnter " + STYLING["BOLD"] + "'yes'" + STYLING[
@@ -238,7 +239,7 @@ keep_original_filename = 'no'
 create_combined_images = 'yes'
 create_reversed_combined = 'no'
 create_motion_photos = 'no'
-delete_combined_webp = 'no'
+delete_combined_webp = 'yes'
 debug_logging = 'no'
 
 if advanced_settings == 'yes':
@@ -253,22 +254,24 @@ if advanced_settings == 'yes':
           "   Option 2: YYYY-MM-DD...primary/secondary.jpeg (Answer: NO)")
     keep_original_filename = ask_setting("   Keep original filename in output?", 'no')
 
-    # 3. Create Combined
+    # 3. Create Combined (Standard)
     create_combined_images = ask_setting("\n3. Create combined images (Standard View)?", 'yes')
 
-    if create_combined_images == 'yes':
-        # 4. Reversed
-        create_reversed_combined = ask_setting("4. Also create reversed combined images (Secondary as background)?",
-                                               'no')
+    # 4. Create Reversed (Independent Option)
+    create_reversed_combined = ask_setting("4. Create reversed combined images (Secondary as background)?", 'no')
 
-        # 5. Motion Photos
-        if convert_to_jpeg == 'yes':
-            create_motion_photos = ask_setting("5. Create Motion Photos (Live Photos) using BTS video?", 'no')
-            # 6. Cleanup
-            delete_combined_webp = ask_setting("6. Delete intermediate .webp files in combined folders?", 'no')
-        else:
-            print(STYLING["BLUE"] + "   (Skipping Motion Photo & WebP cleanup options: JPEG conversion required)" +
-                  STYLING["RESET"])
+    # 5. Motion Photos (Only if Standard Combined is on AND JPEG is on)
+    if create_combined_images == 'yes' and convert_to_jpeg == 'yes':
+        create_motion_photos = ask_setting("5. Create Motion Photos (Live Photos) for Standard View?", 'no')
+    else:
+        create_motion_photos = 'no'
+        print(STYLING["BLUE"] + "   (Skipping Motion Photo option: Requires Standard View + JPEG)" + STYLING["RESET"])
+
+    # 6. Cleanup (Changed default to YES)
+    if convert_to_jpeg == 'yes' and (create_combined_images == 'yes' or create_reversed_combined == 'yes'):
+        delete_combined_webp = ask_setting("6. Delete intermediate .webp files in combined folders?", 'yes')
+    else:
+        delete_combined_webp = 'no'
 
     # 7. Debug Log
     debug_logging = ask_setting("\n7. Enable debug logging to file ('debug_log.txt')?", 'no')
@@ -284,7 +287,7 @@ if debug_logging == 'yes':
     except Exception as e:
         print(f"Failed to setup log file: {e}")
 
-if convert_to_jpeg == 'no' and create_combined_images == 'no':
+if convert_to_jpeg == 'no' and create_combined_images == 'no' and create_reversed_combined == 'no':
     print("Script will continue in 5 seconds.")
 
 
@@ -445,53 +448,29 @@ def combine_videos(primary_path, secondary_path, output_path, primary_meta=None,
         return False
 
 
-# --- REPLICATED MOTION PHOTO FUNCTION (Muxer.py Logic) ---
+# --- REPLICATED MOTION PHOTO FUNCTION ---
 def create_motion_photo(image_path, video_path):
-    """
-    Muxes an image and a video using the exact MotionPhoto2 method:
-    1. Calculate Padding/Length tags.
-    2. Write XMP sidecar.
-    3. Copy image to temp file (prevents locking).
-    4. ExifTool copies XMP to temp file.
-    5. Read temp file, append video/footer, write to original.
-    """
     try:
-        # 1. Read Video Bytes & Init Tags
         with open(video_path, "rb") as f:
             video_bytes = f.read()
-
         tags = SamsungTags(video_bytes)
         video_size = tags.get_video_size()
         image_padding = tags.get_image_padding()
 
-        # 2. Prepare XMP Sidecar with correct values
-        # Replaces placeholders in the constant template
         xmp_content = MOTION_PHOTO_XMP_TEMPLATE.replace('Item:Length="0"', f'Item:Length="{video_size}"')
         xmp_content = xmp_content.replace('Item:Padding="{padding}"', f'Item:Padding="{image_padding}"')
         xmp_content = xmp_content.replace('Item:Length="{length}"', f'Item:Length="{video_size}"')
 
-        # Write XMP to temp file
         xmp_path = image_path.with_suffix('.xmp_temp')
         with open(xmp_path, "w", encoding="utf-8") as f:
             f.write(xmp_content)
 
-        # 3. Work on a Temporary Image File (Muxer.py workflow)
         temp_image_path = image_path.with_name(f"temp_{image_path.name}")
         shutil.copy2(image_path, temp_image_path)
 
-        # 4. Run ExifTool on Temp Image
-        # Muxer.py uses -tagsfromfile XMP -xmp IMAGE
-        cmd = [
-            "exiftool",
-            "-overwrite_original",
-            "-tagsfromfile", str(xmp_path),
-            "-xmp",
-            str(temp_image_path)
-        ]
-
+        cmd = ["exiftool", "-overwrite_original", "-tagsfromfile", str(xmp_path), "-xmp", str(temp_image_path)]
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
 
-        # Clean up sidecar immediately
         if xmp_path.exists(): xmp_path.unlink()
 
         if result.returncode != 0:
@@ -499,29 +478,20 @@ def create_motion_photo(image_path, video_path):
             if temp_image_path.exists(): temp_image_path.unlink()
             return False
 
-        # 5. Read Injected Image & Append Video
         with open(temp_image_path, "rb") as f:
             image_bytes = f.read()
-
-        # Cleanup temp image
         if temp_image_path.exists(): temp_image_path.unlink()
 
         tags.set_image_size(len(image_bytes))
         footer = tags.video_footer()
 
-        # Write Final Result (Overwrite Original)
         with open(image_path, "wb") as f:
             f.write(image_bytes)
             f.write(footer)
 
-        logging.info(f"Successfully muxed Motion Photo: {image_path.name}")
         return True
-
     except Exception as e:
         logging.error(f"Failed to create Motion Photo for {image_path.name}: {e}")
-        # Clean up in case of error
-        if 'xmp_path' in locals() and xmp_path.exists(): xmp_path.unlink()
-        if 'temp_image_path' in locals() and temp_image_path.exists(): temp_image_path.unlink()
         return False
 
 
@@ -539,10 +509,13 @@ for entry in data:
         location = entry.get('location')
         caption = entry.get('caption')
 
+        # Check BTS statistics
+        if 'btsMedia' in entry:
+            stats_entries_with_bts_count += 1
+
         entry_assets = {'primary': None, 'secondary': None, 'bts': None}
         assets_to_process = []
 
-        # EXTRACT METADATA
         if 'primary' in entry:
             p = entry['primary']
             assets_to_process.append({'path': p['path'], 'role': 'primary', 'type': p['mediaType'],
@@ -560,6 +533,11 @@ for entry in data:
             filename = Path(asset['path']).name
             role = asset['role']
             is_video = (asset['type'] == 'video')
+
+            # Count video sources
+            if is_video:
+                stats_video_source_count += 1
+
             src_path = photo_folder / filename
             if not src_path.exists(): src_path = bereal_folder / filename
             if not src_path.exists():
@@ -599,6 +577,8 @@ for entry in data:
                 processed_path = dest
 
             processed_files_count += 1
+            if did_convert: converted_files_count += 1
+
             entry_assets[role] = {'path': processed_path, 'is_video': is_video, 'dims': asset['dims']}
 
         if entry_assets['primary'] and entry_assets['secondary']:
@@ -615,7 +595,7 @@ for entry in data:
         logging.error(f"Error processing entry {entry}: {e}")
 
 # --- COMBINATION PHASE ---
-if create_combined_images == 'yes':
+if create_combined_images == 'yes' or create_reversed_combined == 'yes':
     print(STYLING['BOLD'] + "Generating Combined Memories..." + STYLING['RESET'])
 
     for prim, sec in zip(primary_assets, secondary_assets):
@@ -631,38 +611,44 @@ if create_combined_images == 'yes':
 
         try:
             # 1. STANDARD COMBINATION
-            if p_is_video and s_is_video:
-                combined_filename = f"{timestamp}_combined.mp4"
-                combined_path = output_folder_combined / combined_filename
-                success = combine_videos(p_path, s_path, combined_path, prim['data']['dims'], sec['dims'])
-                if success:
-                    update_video_metadata(combined_path, meta['taken_at'], meta['location'])
+            if create_combined_images == 'yes':
+                if p_is_video and s_is_video:
+                    combined_filename = f"{timestamp}_combined.mp4"
+                    combined_path = output_folder_combined / combined_filename
+                    success = combine_videos(p_path, s_path, combined_path, prim['data']['dims'], sec['dims'])
+                    if success:
+                        update_video_metadata(combined_path, meta['taken_at'], meta['location'])
+                        stats_standard_combined_count += 1
 
-            elif not p_is_video and not s_is_video:
-                ext = '.jpg' if convert_to_jpeg == 'yes' else '.webp'
-                combined_filename = f"{timestamp}_combined{ext}"
-                combined_path = output_folder_combined / combined_filename
+                elif not p_is_video and not s_is_video:
+                    ext = '.jpg' if convert_to_jpeg == 'yes' else '.webp'
+                    combined_filename = f"{timestamp}_combined{ext}"
+                    combined_path = output_folder_combined / combined_filename
 
-                img = combine_images(p_path, s_path)
-                img.save(combined_path, 'JPEG' if convert_to_jpeg == 'yes' else 'WEBP', quality=90)
-                combined_files_count += 1
-                logging.info(f"Combined image saved: {combined_path.name}")
-                update_exif(combined_path, meta['taken_at'], meta['location'], meta['caption'])
-                update_iptc(combined_path, meta['caption'])
+                    img = combine_images(p_path, s_path)
+                    img.save(combined_path, 'JPEG' if convert_to_jpeg == 'yes' else 'WEBP', quality=90)
+                    stats_standard_combined_count += 1
+                    logging.info(f"Combined image saved: {combined_path.name}")
+                    update_exif(combined_path, meta['taken_at'], meta['location'], meta['caption'])
+                    update_iptc(combined_path, meta['caption'])
 
-                # --- MOTION PHOTO CREATION ---
-                if create_motion_photos == 'yes' and bts_info and bts_info['path'] and convert_to_jpeg == 'yes':
-                    logging.info(f"Attempting Motion Photo creation for {combined_path.name}...")
-                    create_motion_photo(combined_path, bts_info['path'])
-                # -----------------------------
+                    # --- MOTION PHOTO CREATION ---
+                    if create_motion_photos == 'yes' and bts_info and bts_info['path'] and convert_to_jpeg == 'yes':
+                        logging.info(f"Attempting Motion Photo creation for {combined_path.name}...")
+                        success = create_motion_photo(combined_path, bts_info['path'])
+                        if success:
+                            stats_motion_photos_created += 1
+                    # -----------------------------
 
-            # 2. REVERSED COMBINATION
+            # 2. REVERSED COMBINATION (INDEPENDENT)
             if create_reversed_combined == 'yes':
                 if p_is_video and s_is_video:
                     combined_filename_rev = f"{timestamp}_combined_reversed.mp4"
                     combined_path_rev = output_folder_combined_reversed / combined_filename_rev
-                    combine_videos(s_path, p_path, combined_path_rev, sec['dims'], prim['data']['dims'])
-                    update_video_metadata(combined_path_rev, meta['taken_at'], meta['location'])
+                    success = combine_videos(s_path, p_path, combined_path_rev, sec['dims'], prim['data']['dims'])
+                    if success:
+                        update_video_metadata(combined_path_rev, meta['taken_at'], meta['location'])
+                        stats_reversed_combined_count += 1
 
                 elif not p_is_video and not s_is_video:
                     ext = '.jpg' if convert_to_jpeg == 'yes' else '.webp'
@@ -671,6 +657,7 @@ if create_combined_images == 'yes':
 
                     img = combine_images(s_path, p_path)
                     img.save(combined_path_rev, 'JPEG' if convert_to_jpeg == 'yes' else 'WEBP', quality=90)
+                    stats_reversed_combined_count += 1
                     update_exif(combined_path_rev, meta['taken_at'], meta['location'], meta['caption'])
                     update_iptc(combined_path_rev, meta['caption'])
 
@@ -691,4 +678,22 @@ if delete_combined_webp == 'yes' and convert_to_jpeg == 'yes':
             except:
                 pass
 
-logging.info(f"Finished processing. Total processed: {processed_files_count}")
+# --- FINAL DETAILED LOGGING ---
+logging.info(f"""
+Finished processing.
+--------------------------------------------
+Total BeReal Entries Processed: {len(data)}
+Files Processed/Copied:         {processed_files_count}
+Files Converted to JPEG:        {converted_files_count}
+Files Skipped:                  {skipped_files_count}
+--------------------------------------------
+Source Details:
+- Video BeReals Found:          {stats_video_source_count}
+- Entries with BTS:             {stats_entries_with_bts_count}
+--------------------------------------------
+Output Details:
+- Standard Combined Created:    {stats_standard_combined_count}
+- Reversed Combined Created:    {stats_reversed_combined_count}
+- Motion Photos Muxed:          {stats_motion_photos_created}
+--------------------------------------------
+""")
